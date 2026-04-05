@@ -62,7 +62,7 @@ apt-get install -y -qq ufw fail2ban curl wget python3 python3-pip python3-venv c
 sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 sed -i 's/#\?X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
-systemctl restart sshd
+systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 
 # Firewall: only SSH + SMTP
 ufw default deny incoming
