@@ -89,13 +89,27 @@ class InboundHandler:
                 for part in msg.walk():
                     content_type = part.get_content_type()
                     disposition = str(part.get("Content-Disposition", ""))
+                    content_id = part.get("Content-ID", "").strip("<>")
 
                     if "attachment" in disposition:
                         attachments.append({
                             "filename": part.get_filename() or "attachment",
                             "content_type": content_type,
                             "data": b64encode(part.get_payload(decode=True) or b"").decode(),
+                            "content_id": content_id,
+                            "is_inline": False,
                         })
+                    elif content_id or "inline" in disposition:
+                        # Inline image/content (referenced by cid: in HTML)
+                        payload_data = part.get_payload(decode=True)
+                        if payload_data and content_type.startswith(("image/", "application/")):
+                            attachments.append({
+                                "filename": part.get_filename() or content_id or "inline",
+                                "content_type": content_type,
+                                "data": b64encode(payload_data).decode(),
+                                "content_id": content_id,
+                                "is_inline": True,
+                            })
                     elif content_type == "text/plain":
                         body_text = part.get_payload(decode=True).decode("utf-8", errors="replace")
                     elif content_type == "text/html":
