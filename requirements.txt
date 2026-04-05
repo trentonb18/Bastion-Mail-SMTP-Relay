@@ -1,0 +1,5 @@
+aiosmtpd>=1.4
+aiohttp>=3.9
+requests>=2.31
+dnspython>=2.6
+dkimpy>=1.1
