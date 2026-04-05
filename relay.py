@@ -240,7 +240,7 @@ async def handle_send(request):
         if cc_addrs:
             msg["Cc"] = ", ".join(cc_addrs)
         msg["Subject"] = subject
-        msg["Message-ID"] = data.get("message_id", email.utils.make_msgid(domain=HOSTNAME))
+        msg["Message-ID"] = data.get("message_id") or email.utils.make_msgid(domain=HOSTNAME)
         msg["Date"] = email.utils.formatdate(localtime=True)
 
         if data.get("reply_to"):
