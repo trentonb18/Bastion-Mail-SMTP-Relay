@@ -36,8 +36,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 MAIL_API_URL = os.environ.get("MAIL_API_URL", "https://smtp.bastionhq.me")
-INBOUND_API_SECRET = os.environ.get("INBOUND_API_SECRET", "")
-OUTBOUND_API_SECRET = os.environ.get("OUTBOUND_API_SECRET", INBOUND_API_SECRET)
+API_SECRET = os.environ.get("API_SECRET", "") or os.environ.get("API_SECRET", "")
 HOSTNAME = os.environ.get("MAIL_HOSTNAME", "smtp.bastionhq.me")
 TLS_CERT = os.environ.get("TLS_CERT", "/etc/letsencrypt/live/smtp.bastionhq.me/fullchain.pem")
 TLS_KEY = os.environ.get("TLS_KEY", "/etc/letsencrypt/live/smtp.bastionhq.me/privkey.pem")
@@ -127,7 +126,7 @@ class InboundHandler:
                 f"{MAIL_API_URL}/api/v1/inbound/",
                 json=payload,
                 headers={
-                    "Authorization": f"Bearer {INBOUND_API_SECRET}",
+                    "Authorization": f"Bearer {API_SECRET}",
                     "Content-Type": "application/json",
                 },
                 timeout=30,
@@ -167,7 +166,7 @@ async def handle_send(request):
     """
     # Auth check
     auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {OUTBOUND_API_SECRET}":
+    if auth != f"Bearer {API_SECRET}":
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     try:
