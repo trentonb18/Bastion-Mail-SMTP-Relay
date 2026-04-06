@@ -491,15 +491,19 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=bastion
+Group=bastion
 WorkingDirectory=/opt/bastion-relay
 EnvironmentFile=/opt/bastion-relay/.env
 ExecStart=/opt/bastion-relay/venv/bin/python /opt/bastion-relay/relay.py
 Restart=always
 RestartSec=5
 
-# Security
+# Allow binding to privileged port 25 without running as root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

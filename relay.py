@@ -44,6 +44,12 @@ except ImportError:
 MAIL_API_URL = os.environ.get("MAIL_API_URL", "https://smtp.bastionhq.me")
 ADMIN_API_URL = os.environ.get("ADMIN_API_URL", "https://bastionhq.me")
 API_SECRET = os.environ.get("API_SECRET", "") or os.environ.get("INBOUND_API_SECRET", "")
+
+# Crash immediately if API_SECRET is not configured — an empty secret is an open relay
+if not API_SECRET:
+    print("FATAL: API_SECRET (or INBOUND_API_SECRET) environment variable is not set. "
+          "The relay cannot start without a secret.", file=sys.stderr)
+    sys.exit(1)
 HOSTNAME = os.environ.get("HOSTNAME", os.environ.get("MAIL_HOSTNAME", "smtp.bastionhq.me"))
 DKIM_KEY_PATH = os.environ.get("DKIM_KEY_PATH", "/opt/bastion-relay/dkim/private.key")
 DKIM_SELECTOR = os.environ.get("DKIM_SELECTOR", "bastion")
@@ -63,6 +69,48 @@ log = logging.getLogger("bastion-relay")
 
 
 # ---------------------------------------------------------------------------
+# Allowed recipient domains (fetched from admin API, cached)
+# ---------------------------------------------------------------------------
+
+_allowed_domains_cache = {"domains": set(), "expires": 0.0}
+
+def _get_allowed_domains():
+    """Fetch verified recipient domains from the admin API. Cached for 5 minutes.
+    Falls back to ALLOWED_DOMAINS env var if API is unavailable."""
+    now = time.time()
+    if _allowed_domains_cache["expires"] > now and _allowed_domains_cache["domains"]:
+        return _allowed_domains_cache["domains"]
+
+    if ADMIN_API_URL and API_SECRET:
+        try:
+            r = requests.get(
+                f"{ADMIN_API_URL}/api/domains/verified/",
+                headers={"Authorization": f"Bearer {API_SECRET}"},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                domains = set(data.get("domains", []))
+                if domains:
+                    _allowed_domains_cache["domains"] = domains
+                    _allowed_domains_cache["expires"] = now + 300
+                    log.info("Loaded %d allowed domains from admin API", len(domains))
+                    return domains
+        except Exception as e:
+            log.warning("Could not fetch allowed domains from admin API: %s", e)
+
+    # Fallback: ALLOWED_DOMAINS env var (comma-separated)
+    env_domains = os.environ.get("ALLOWED_DOMAINS", "")
+    if env_domains:
+        domains = set(d.strip() for d in env_domains.split(",") if d.strip())
+        _allowed_domains_cache["domains"] = domains
+        _allowed_domains_cache["expires"] = now + 300
+        return domains
+
+    return set()
+
+
+# ---------------------------------------------------------------------------
 # Inbound SMTP Handler
 # ---------------------------------------------------------------------------
 
@@ -70,6 +118,14 @@ class InboundHandler:
     """Receives email via SMTP and forwards to the Bastion Mail API."""
 
     async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
+        # Reject mail to unknown domains — prevents open relay abuse
+        domain = address.split("@")[1] if "@" in address else ""
+        if not domain:
+            return "550 Invalid recipient address"
+        allowed = _get_allowed_domains()
+        if allowed and domain not in allowed:
+            log.info("Rejected inbound RCPT to unknown domain: %s", domain)
+            return "550 Mailbox unavailable"
         envelope.rcpt_tos.append(address)
         return "250 OK"
 
@@ -149,20 +205,27 @@ class InboundHandler:
             except Exception as e:
                 dkim_result = {"result": "error", "detail": str(e)[:200]}
 
-            # Reverse DNS check
+            # Reverse DNS check — with explicit timeout to avoid blocking the event loop
             rdns_result = {"result": "none", "detail": "Not checked"}
             if sender_ip:
                 try:
                     import socket
-                    hostname = socket.gethostbyaddr(sender_ip)[0]
-                    # Verify forward lookup matches
-                    forward_ips = socket.gethostbyname_ex(hostname)[2]
-                    if sender_ip in forward_ips:
-                        rdns_result = {"result": "pass", "detail": f"{sender_ip} → {hostname}", "hostname": hostname}
-                    else:
-                        rdns_result = {"result": "fail", "detail": f"rDNS {hostname} doesn't resolve back to {sender_ip}", "hostname": hostname}
+                    old_timeout = socket.getdefaulttimeout()
+                    socket.setdefaulttimeout(3)  # 3-second cap on DNS lookups
+                    try:
+                        hostname = socket.gethostbyaddr(sender_ip)[0]
+                        # Verify forward lookup matches
+                        forward_ips = socket.gethostbyname_ex(hostname)[2]
+                        if sender_ip in forward_ips:
+                            rdns_result = {"result": "pass", "detail": f"{sender_ip} → {hostname}", "hostname": hostname}
+                        else:
+                            rdns_result = {"result": "fail", "detail": f"rDNS {hostname} doesn't resolve back to {sender_ip}", "hostname": hostname}
+                    finally:
+                        socket.setdefaulttimeout(old_timeout)
                 except socket.herror:
                     rdns_result = {"result": "fail", "detail": f"No rDNS record for {sender_ip}"}
+                except socket.timeout:
+                    rdns_result = {"result": "error", "detail": "rDNS lookup timed out"}
                 except Exception as e:
                     rdns_result = {"result": "error", "detail": str(e)[:200]}
 
@@ -198,7 +261,7 @@ class InboundHandler:
             )
 
             if resp.status_code in (200, 201):
-                log.info(f"Forwarded to API: {msg.get('Subject', '?')}")
+                log.info("Inbound email forwarded to API (from=%s, recipients=%d)", envelope.mail_from, len(envelope.rcpt_tos))
                 return "250 Message accepted"
             else:
                 log.error(f"API returned {resp.status_code}: {resp.text[:200]}")
@@ -261,6 +324,9 @@ def _get_dkim_key(domain):
 # Outbound HTTP API
 # ---------------------------------------------------------------------------
 
+MAX_REQUEST_BYTES = 50 * 1024 * 1024  # 50 MB — hard cap on inbound HTTP payloads
+
+
 async def handle_send(request):
     """HTTP endpoint for sending outbound email.
 
@@ -280,10 +346,20 @@ async def handle_send(request):
     # Auth check
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_SECRET}":
+        log.warning("Unauthorized /send attempt from %s", request.remote)
         return web.json_response({"error": "Unauthorized"}, status=401)
 
+    # Reject oversized payloads before reading body
+    content_length = request.content_length
+    if content_length is not None and content_length > MAX_REQUEST_BYTES:
+        return web.json_response({"error": "Payload too large"}, status=413)
+
     try:
-        data = await request.json()
+        body = await request.read()
+        if len(body) > MAX_REQUEST_BYTES:
+            return web.json_response({"error": "Payload too large"}, status=413)
+        import json as _json
+        data = _json.loads(body)
     except Exception:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
@@ -368,11 +444,16 @@ async def handle_send(request):
 
         for recipient in all_recipients:
             try:
-                domain = recipient.split("@")[1]
+                parts = recipient.split("@")
+                if len(parts) != 2 or not parts[1]:
+                    log.warning("Skipping malformed recipient address: %r", recipient)
+                    errors.append({"address": recipient, "error": "Invalid email address format"})
+                    continue
+                domain = parts[1]
                 _send_to_mx(domain, from_address, recipient, msg_string)
-                log.info(f"Sent to {recipient}")
+                log.info("Sent to %s", recipient)
             except Exception as e:
-                log.error(f"Failed to send to {recipient}: {e}")
+                log.error("Failed to send to %s: %s", recipient, e)
                 errors.append({"address": recipient, "error": str(e)})
 
         if errors and len(errors) == len(all_recipients):
@@ -438,6 +519,29 @@ async def handle_health(request):
     return web.json_response({"status": "ok", "hostname": HOSTNAME})
 
 
+async def handle_cache_clear(request):
+    """Force-invalidate the DKIM key cache (and optionally allowed domains cache).
+    POST /cache/clear?domain=example.com  — clear one domain
+    POST /cache/clear                      — clear all domains
+    Requires Bearer API_SECRET.
+    """
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {API_SECRET}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    domain = request.rel_url.query.get("domain")
+    if domain:
+        _dkim_cache.pop(domain, None)
+        log.info("DKIM cache cleared for domain: %s", domain)
+        return web.json_response({"status": "cleared", "domain": domain})
+    else:
+        _dkim_cache.clear()
+        _allowed_domains_cache["domains"] = set()
+        _allowed_domains_cache["expires"] = 0.0
+        log.info("DKIM + allowed-domains cache fully cleared")
+        return web.json_response({"status": "cleared", "scope": "all"})
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -458,13 +562,16 @@ def main():
     controller.start()
     log.info(f"SMTP listening on port {SMTP_PORT}")
 
-    # Start outbound HTTP API
+    # Start outbound HTTP API — bind to 127.0.0.1 so it's only accessible via the
+    # nginx reverse proxy (which handles TLS). Never expose directly to the internet.
     app = web.Application()
     app.router.add_post("/send", handle_send)
     app.router.add_get("/health", handle_health)
+    app.router.add_post("/cache/clear", handle_cache_clear)
 
-    log.info(f"HTTP API listening on port {HTTP_PORT}")
-    web.run_app(app, host="0.0.0.0", port=HTTP_PORT)
+    http_host = os.environ.get("HTTP_HOST", "127.0.0.1")
+    log.info(f"HTTP API listening on {http_host}:{HTTP_PORT}")
+    web.run_app(app, host=http_host, port=HTTP_PORT)
 
 
 if __name__ == "__main__":
