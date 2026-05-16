@@ -244,9 +244,16 @@ class InboundHandler:
                     else:
                         body_text = t
 
+            # Use the From: header (human-visible) for display; keep the SMTP
+            # envelope sender (Return-Path / MAIL FROM) separate — that's the
+            # bounce address set by the sender's infra, not a real "From".
+            from_name, from_header_addr = email.utils.parseaddr(msg.get("From", ""))
+            display_from_address = from_header_addr or sender
+
             data = {
-                "from_address": sender,
-                "from_name": email.utils.parseaddr(msg.get("From", ""))[0],
+                "from_address": display_from_address,
+                "from_name": from_name,
+                "envelope_from": sender,
                 "to": [a for _, a in email.utils.getaddresses(msg.get_all("To", []))],
                 "cc": [a for _, a in email.utils.getaddresses(msg.get_all("Cc", []))],
                 "subject": msg.get("Subject", ""),

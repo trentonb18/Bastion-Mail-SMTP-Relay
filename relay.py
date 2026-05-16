@@ -144,10 +144,35 @@ class InboundHandler:
             if msg.is_multipart():
                 for part in msg.walk():
                     content_type = part.get_content_type()
+                    # Skip multipart containers — only leaf parts carry payload
+                    if content_type.startswith("multipart/"):
+                        continue
                     disposition = str(part.get("Content-Disposition", ""))
                     content_id = part.get("Content-ID", "").strip("<>")
+                    is_attachment = "attachment" in disposition
+                    is_inline_disposition = "inline" in disposition
 
-                    if "attachment" in disposition:
+                    # Check body parts BEFORE inline/attachment branches.
+                    # LinkedIn, Apple, and many bulk senders set
+                    # Content-Disposition: inline on the actual text/html body —
+                    # treating that as an "inline image" silently loses the body.
+                    if content_type == "text/plain" and not is_attachment and not body_text:
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            charset = part.get_content_charset() or "utf-8"
+                            try:
+                                body_text = payload.decode(charset, errors="replace")
+                            except (LookupError, UnicodeDecodeError):
+                                body_text = payload.decode("utf-8", errors="replace")
+                    elif content_type == "text/html" and not is_attachment and not body_html:
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            charset = part.get_content_charset() or "utf-8"
+                            try:
+                                body_html = payload.decode(charset, errors="replace")
+                            except (LookupError, UnicodeDecodeError):
+                                body_html = payload.decode("utf-8", errors="replace")
+                    elif is_attachment:
                         attachments.append({
                             "filename": part.get_filename() or "attachment",
                             "content_type": content_type,
@@ -155,8 +180,8 @@ class InboundHandler:
                             "content_id": content_id,
                             "is_inline": False,
                         })
-                    elif content_id or "inline" in disposition:
-                        # Inline image/content (referenced by cid: in HTML)
+                    elif content_id or is_inline_disposition:
+                        # Inline image referenced by cid: in the HTML body
                         payload_data = part.get_payload(decode=True)
                         if payload_data and content_type.startswith(("image/", "application/")):
                             attachments.append({
@@ -166,10 +191,6 @@ class InboundHandler:
                                 "content_id": content_id,
                                 "is_inline": True,
                             })
-                    elif content_type == "text/plain":
-                        body_text = part.get_payload(decode=True).decode("utf-8", errors="replace")
-                    elif content_type == "text/html":
-                        body_html = part.get_payload(decode=True).decode("utf-8", errors="replace")
             else:
                 content_type = msg.get_content_type()
                 payload = msg.get_payload(decode=True)
@@ -183,6 +204,14 @@ class InboundHandler:
             # Build recipient lists
             to_addrs = [addr for _, addr in email.utils.getaddresses(msg.get_all("To", []))]
             cc_addrs = [addr for _, addr in email.utils.getaddresses(msg.get_all("Cc", []))]
+
+            # Parse the From: header — that's the human-visible sender. The SMTP
+            # envelope (MAIL FROM) is usually a unique bounce/Return-Path address
+            # set by the sending infrastructure (e.g. SendGrid) and should not be
+            # shown to users. We pass it separately so SPF / Return-Path display
+            # can still use it.
+            from_name, from_header_addr = email.utils.parseaddr(msg.get("From", ""))
+            display_from_address = from_header_addr or envelope.mail_from
 
             # Get sender IP from the SMTP session
             sender_ip = ""
@@ -231,8 +260,9 @@ class InboundHandler:
 
             # Build payload for API
             payload = {
-                "from_address": envelope.mail_from,
-                "from_name": str(email.utils.parseaddr(msg.get("From", ""))[0]),
+                "from_address": display_from_address,
+                "from_name": from_name,
+                "envelope_from": envelope.mail_from,
                 "to": to_addrs,
                 "cc": cc_addrs,
                 "subject": msg.get("Subject", ""),
