@@ -222,19 +222,37 @@ class InboundHandler:
                 for part in msg.walk():
                     ct = part.get_content_type()
                     disp = str(part.get("Content-Disposition", ""))
+                    cid = part.get("Content-ID", "").strip("<>")
                     payload = part.get_payload(decode=True)
                     if not payload:
                         continue
-                    if "attachment" in disp:
+                    is_attachment = "attachment" in disp
+                    is_inline_disp = "inline" in disp
+                    # Body parts first by content type — guards against senders
+                    # that set Content-Disposition: inline on the body itself.
+                    if ct == "text/plain" and not is_attachment and not body_text:
+                        body_text = payload.decode("utf-8", errors="replace")
+                    elif ct == "text/html" and not is_attachment and not body_html:
+                        body_html = payload.decode("utf-8", errors="replace")
+                    elif is_attachment:
                         attachments.append({
                             "filename": part.get_filename() or "file",
                             "content_type": ct,
                             "data": b64encode(payload).decode(),
+                            "content_id": cid,
+                            "is_inline": False,
                         })
-                    elif ct == "text/plain" and not body_text:
-                        body_text = payload.decode("utf-8", errors="replace")
-                    elif ct == "text/html" and not body_html:
-                        body_html = payload.decode("utf-8", errors="replace")
+                    elif (cid or is_inline_disp) and ct.startswith(("image/", "application/")):
+                        # Inline image referenced from the HTML body via cid:.
+                        # Forward these so the Mail-side renderer can swap
+                        # cid:xxx for /mail/attachment/<id>/inline/.
+                        attachments.append({
+                            "filename": part.get_filename() or cid or "inline",
+                            "content_type": ct,
+                            "data": b64encode(payload).decode(),
+                            "content_id": cid,
+                            "is_inline": True,
+                        })
             else:
                 payload = msg.get_payload(decode=True)
                 if payload:
