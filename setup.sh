@@ -268,6 +268,50 @@ class InboundHandler:
             from_name, from_header_addr = email.utils.parseaddr(msg.get("From", ""))
             display_from_address = from_header_addr or sender
 
+            # Sender IP from the SMTP session — required for SPF eval upstream.
+            sender_ip = ""
+            try:
+                sender_ip = session.peer[0] if session.peer else ""
+            except Exception:
+                pass
+
+            # DKIM verify against the raw message bytes.
+            dkim_result = {"result": "none", "detail": "Not checked"}
+            try:
+                if HAS_DKIM:
+                    ok = dkim.verify(envelope.content)
+                    dkim_result = {
+                        "result": "pass" if ok else "fail",
+                        "detail": "Signature valid" if ok else "Signature invalid or missing",
+                    }
+                else:
+                    dkim_result = {"result": "none", "detail": "DKIM library not available"}
+            except Exception as e:
+                dkim_result = {"result": "error", "detail": str(e)[:200]}
+
+            # Forward-confirmed rDNS check on the sending IP (3s timeout, sync
+            # is fine — DATA handlers already block per-message).
+            rdns_result = {"result": "none", "detail": "Not checked"}
+            if sender_ip:
+                import socket as _socket
+                _old = _socket.getdefaulttimeout()
+                _socket.setdefaulttimeout(3)
+                try:
+                    hostname = _socket.gethostbyaddr(sender_ip)[0]
+                    forward_ips = _socket.gethostbyname_ex(hostname)[2]
+                    if sender_ip in forward_ips:
+                        rdns_result = {"result": "pass", "detail": f"{sender_ip} -> {hostname}", "hostname": hostname}
+                    else:
+                        rdns_result = {"result": "fail", "detail": f"rDNS {hostname} doesn't resolve back to {sender_ip}", "hostname": hostname}
+                except _socket.herror:
+                    rdns_result = {"result": "fail", "detail": f"No rDNS record for {sender_ip}"}
+                except _socket.timeout:
+                    rdns_result = {"result": "error", "detail": "rDNS lookup timed out"}
+                except Exception as e:
+                    rdns_result = {"result": "error", "detail": str(e)[:200]}
+                finally:
+                    _socket.setdefaulttimeout(_old)
+
             data = {
                 "from_address": display_from_address,
                 "from_name": from_name,
@@ -282,6 +326,9 @@ class InboundHandler:
                 "references": msg.get("References", ""),
                 "recipients": recipients,
                 "attachments": attachments,
+                "sender_ip": sender_ip,
+                "dkim_result": dkim_result,
+                "rdns_result": rdns_result,
             }
 
             r = requests.post(
