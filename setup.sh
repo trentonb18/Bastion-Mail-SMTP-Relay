@@ -70,6 +70,7 @@ ufw default allow outgoing
 ufw allow ssh
 ufw allow 25/tcp     # SMTP inbound
 ufw allow 80/tcp     # Let's Encrypt challenge only
+ufw allow 443/tcp    # HTTPS — nginx fronting the outbound /send API
 ufw --force enable
 
 # fail2ban for SSH
