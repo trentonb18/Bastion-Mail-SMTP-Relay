@@ -117,6 +117,28 @@ def _get_allowed_domains():
 class InboundHandler:
     """Receives email via SMTP and forwards to the Bastion Mail API."""
 
+    async def handle_HELO(self, server, session, envelope, hostname):
+        # Log every connection — useful for diagnosing "mail bounces but nothing
+        # in logs" because the sender disconnected before reaching DATA.
+        peer = session.peer[0] if session.peer else "?"
+        log.info("HELO from %s (peer=%s)", hostname, peer)
+        session.host_name = hostname
+        return "250 {}".format(server.hostname)
+
+    async def handle_EHLO(self, server, session, envelope, hostname, responses):
+        peer = session.peer[0] if session.peer else "?"
+        log.info("EHLO from %s (peer=%s)", hostname, peer)
+        session.host_name = hostname
+        # aiosmtpd populates `responses` with the standard extensions
+        # (PIPELINING, 8BITMIME, SIZE, STARTTLS if tls_context is set, …).
+        # Returning the list as-is lets the framework do the right thing.
+        return responses
+
+    async def handle_STARTTLS(self, server, session, envelope):
+        peer = session.peer[0] if session.peer else "?"
+        log.info("STARTTLS upgrade negotiated with peer=%s", peer)
+        return "220 Ready to start TLS"
+
     async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
         # Reject mail to unknown domains — prevents open relay abuse
         domain = address.split("@")[1] if "@" in address else ""
@@ -576,6 +598,34 @@ async def handle_cache_clear(request):
 # Main
 # ---------------------------------------------------------------------------
 
+def _build_starttls_context():
+    """Load the Let's Encrypt cert into an SSL context for STARTTLS.
+
+    Returns None if the cert files aren't readable — the relay still starts,
+    just in plaintext mode (and we warn loudly so ops sees it in logs).
+    Modern senders (Google Workspace, Microsoft, Mimecast, anyone with
+    MTA-STS / DANE) won't deliver to a plaintext SMTP server, so production
+    deployments MUST have a working cert here.
+    """
+    if not os.path.exists(TLS_CERT) or not os.path.exists(TLS_KEY):
+        log.warning(
+            "TLS cert/key not found (cert=%s key=%s) — STARTTLS will NOT be "
+            "advertised, strict senders will refuse to deliver mail.",
+            TLS_CERT, TLS_KEY,
+        )
+        return None
+    try:
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(certfile=TLS_CERT, keyfile=TLS_KEY)
+        # SMTP STARTTLS deployments are happy with TLS 1.2+. Disable old
+        # versions explicitly even if the system default permits them.
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        return ctx
+    except Exception as e:
+        log.error("Failed to load TLS cert (%s): %s — falling back to plaintext", TLS_CERT, e)
+        return None
+
+
 def main():
     log.info(f"Bastion Mail SMTP Relay starting on {HOSTNAME}")
     log.info(f"SMTP port: {SMTP_PORT}, HTTP port: {HTTP_PORT}")
@@ -583,12 +633,22 @@ def main():
 
     # Start inbound SMTP server
     handler = InboundHandler()
-    controller = aiosmtpd.controller.Controller(
-        handler,
-        hostname="0.0.0.0",
-        port=SMTP_PORT,
-        server_hostname=HOSTNAME,
-    )
+    tls_context = _build_starttls_context()
+    controller_kwargs = {
+        "hostname": "0.0.0.0",
+        "port": SMTP_PORT,
+        "server_hostname": HOSTNAME,
+    }
+    if tls_context is not None:
+        # Advertise STARTTLS via EHLO. require_starttls=False keeps backward
+        # compatibility with old senders that won't upgrade — they can still
+        # deliver, just unencrypted. Switch to True if you want to enforce.
+        controller_kwargs["tls_context"] = tls_context
+        controller_kwargs["require_starttls"] = False
+        log.info("STARTTLS enabled with cert: %s", TLS_CERT)
+    else:
+        log.warning("STARTTLS NOT enabled — strict senders will bounce mail")
+    controller = aiosmtpd.controller.Controller(handler, **controller_kwargs)
     controller.start()
     log.info(f"SMTP listening on port {SMTP_PORT}")
 

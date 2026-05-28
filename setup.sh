@@ -35,10 +35,42 @@ echo ""
 # Configuration
 # ============================================================================
 
-read -p "Hostname (e.g., smtp.bastionhq.me): " HOSTNAME < /dev/tty
-read -p "Bastion Mail API URL (e.g., https://mail.bastionhq.me): " API_URL < /dev/tty
-read -p "API secret (INBOUND_API_SECRET): " API_SECRET < /dev/tty
-read -p "Email for Let's Encrypt: " LE_EMAIL < /dev/tty
+# Detect existing install — re-runs become idempotent updates instead of
+# scaring the operator into reentering everything. Existing .env values
+# become defaults; press Enter to keep them, type a new value to override.
+EXISTING_INSTALL=0
+HOSTNAME_DEFAULT=""
+API_URL_DEFAULT=""
+API_SECRET_DEFAULT=""
+LE_EMAIL_DEFAULT=""
+ADMIN_API_URL_DEFAULT=""
+if [ -f /opt/bastion-relay/.env ]; then
+    EXISTING_INSTALL=1
+    log "Existing installation detected — current values in /opt/bastion-relay/.env will be used as defaults"
+    # Parse only the lines we care about (avoid 'source' executing anything)
+    HOSTNAME_DEFAULT=$(grep -E '^HOSTNAME=' /opt/bastion-relay/.env | head -1 | cut -d= -f2-)
+    API_URL_DEFAULT=$(grep -E '^MAIL_API_URL=' /opt/bastion-relay/.env | head -1 | cut -d= -f2-)
+    API_SECRET_DEFAULT=$(grep -E '^API_SECRET=' /opt/bastion-relay/.env | head -1 | cut -d= -f2-)
+    ADMIN_API_URL_DEFAULT=$(grep -E '^ADMIN_API_URL=' /opt/bastion-relay/.env | head -1 | cut -d= -f2-)
+fi
+# Let's Encrypt remembers the email — we can pull from there for renewals
+if [ -d /etc/letsencrypt/accounts ]; then
+    LE_EMAIL_DEFAULT=$(find /etc/letsencrypt/accounts -name regr.json 2>/dev/null | head -1 | xargs -r grep -oE '"mailto:[^"]+"' 2>/dev/null | head -1 | sed 's|"mailto:||;s|"$||')
+fi
+
+prompt_with_default() {
+    local prompt="$1" default="$2" varname="$3"
+    local display_default=""
+    if [ -n "$default" ]; then display_default=" [$default]"; fi
+    read -p "${prompt}${display_default}: " input < /dev/tty
+    if [ -z "$input" ]; then input="$default"; fi
+    eval "$varname=\"$input\""
+}
+
+prompt_with_default "Hostname (e.g., smtp.bastionhq.me)" "$HOSTNAME_DEFAULT"   HOSTNAME
+prompt_with_default "Bastion Mail API URL (e.g., https://mail.bastionhq.me)" "$API_URL_DEFAULT" API_URL
+prompt_with_default "API secret (INBOUND_API_SECRET)" "$API_SECRET_DEFAULT"   API_SECRET
+prompt_with_default "Email for Let's Encrypt" "$LE_EMAIL_DEFAULT"             LE_EMAIL
 
 [[ -z "$HOSTNAME" ]] && error "Hostname required"
 [[ -z "$API_URL" ]] && error "API URL required"
@@ -67,10 +99,13 @@ systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 # Firewall: only SSH + SMTP
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow ssh
-ufw allow 25/tcp     # SMTP inbound
-ufw allow 80/tcp     # Let's Encrypt challenge only
-ufw allow 443/tcp    # HTTPS — nginx fronting the outbound /send API
+# Full open-port list — every port the relay legitimately uses. `ufw allow`
+# is idempotent so re-running on an existing install is a no-op for already-
+# allowed rules.
+ufw allow 22/tcp     # SSH (admin access)
+ufw allow 25/tcp     # SMTP inbound (mail receipt + STARTTLS)
+ufw allow 80/tcp     # HTTP — Let's Encrypt HTTP-01 challenge + redirect to 443
+ufw allow 443/tcp    # HTTPS — nginx fronting the outbound /send API + /health
 ufw --force enable
 
 # fail2ban for SSH
@@ -116,19 +151,33 @@ certbot certonly --standalone --non-interactive --agree-tos \
     --email "$LE_EMAIL" -d "$HOSTNAME" 2>/dev/null \
     || warn "Certbot failed — ensure DNS A record points to $SERVER_IP first"
 
-# Auto-renew
-echo "0 3 * * * root certbot renew --quiet --deploy-hook 'systemctl restart bastion-relay'" \
+# Grant the bastion service user read access to the cert + key. Without this
+# the relay can't load privkey.pem (default 600 root:root) and STARTTLS stays
+# off, causing strict senders to bounce inbound mail.
+if [ -d /etc/letsencrypt/archive ]; then
+    chgrp -R bastion /etc/letsencrypt/archive /etc/letsencrypt/live 2>/dev/null || true
+    chmod -R g+rX /etc/letsencrypt/archive /etc/letsencrypt/live 2>/dev/null || true
+fi
+
+# Auto-renew — re-apply cert perms after each renewal so STARTTLS stays working
+echo "0 3 * * * root certbot renew --quiet --deploy-hook 'chgrp -R bastion /etc/letsencrypt/archive /etc/letsencrypt/live && chmod -R g+rX /etc/letsencrypt/archive /etc/letsencrypt/live && systemctl restart bastion-relay'" \
     > /etc/cron.d/bastion-certbot
 
 # ============================================================================
 # 3. DKIM key
 # ============================================================================
 
-log "Generating DKIM key..."
 mkdir -p /opt/bastion-relay/dkim
-openssl genrsa -out /opt/bastion-relay/dkim/private.key 2048 2>/dev/null
-openssl rsa -in /opt/bastion-relay/dkim/private.key -pubout -out /opt/bastion-relay/dkim/public.key 2>/dev/null
+if [ -f /opt/bastion-relay/dkim/private.key ] && [ -f /opt/bastion-relay/dkim/public.key ]; then
+    log "DKIM key already exists at /opt/bastion-relay/dkim/private.key — preserving (re-generating would invalidate the published DNS TXT record)"
+else
+    log "Generating DKIM key..."
+    openssl genrsa -out /opt/bastion-relay/dkim/private.key 2048 2>/dev/null
+    openssl rsa -in /opt/bastion-relay/dkim/private.key -pubout -out /opt/bastion-relay/dkim/public.key 2>/dev/null
+fi
+# Always enforce permissions — they could have drifted on update reruns
 chmod 600 /opt/bastion-relay/dkim/private.key
+chmod 644 /opt/bastion-relay/dkim/public.key
 
 DKIM_PUB=$(grep -v "PUBLIC KEY" /opt/bastion-relay/dkim/public.key | tr -d '\n')
 
@@ -164,6 +213,7 @@ import json
 import logging
 import os
 import smtplib
+import ssl
 import sys
 import time
 from base64 import b64encode
@@ -187,6 +237,10 @@ HOSTNAME = os.environ.get("HOSTNAME", "smtp.bastionhq.me")
 DKIM_KEY = os.environ.get("DKIM_KEY_PATH", "/opt/bastion-relay/dkim/private.key")
 DKIM_SELECTOR = os.environ.get("DKIM_SELECTOR", "bastion")
 DKIM_DOMAIN = os.environ.get("DKIM_DOMAIN", "bastionhq.me")
+# Let's Encrypt cert paths — set up by setup.sh / certbot. Used for STARTTLS
+# on inbound SMTP. Modern senders refuse plaintext, so this is essential.
+TLS_CERT = os.environ.get("TLS_CERT", f"/etc/letsencrypt/live/{HOSTNAME}/fullchain.pem")
+TLS_KEY = os.environ.get("TLS_KEY", f"/etc/letsencrypt/live/{HOSTNAME}/privkey.pem")
 
 # Logging — errors only, never log email content
 logging.basicConfig(
@@ -203,6 +257,23 @@ logging.getLogger("aiohttp").setLevel(logging.WARNING)
 # ── Inbound ─────────────────────────────────────────────────────────────
 
 class InboundHandler:
+    async def handle_HELO(self, server, session, envelope, hostname):
+        peer = session.peer[0] if session.peer else "?"
+        log.info("HELO from %s (peer=%s)", hostname, peer)
+        session.host_name = hostname
+        return "250 " + server.hostname
+
+    async def handle_EHLO(self, server, session, envelope, hostname, responses):
+        peer = session.peer[0] if session.peer else "?"
+        log.info("EHLO from %s (peer=%s)", hostname, peer)
+        session.host_name = hostname
+        return responses
+
+    async def handle_STARTTLS(self, server, session, envelope):
+        peer = session.peer[0] if session.peer else "?"
+        log.info("STARTTLS upgrade with peer=%s", peer)
+        return "220 Ready to start TLS"
+
     async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
         envelope.rcpt_tos.append(address)
         return "250 OK"
@@ -509,10 +580,34 @@ async def handle_health(request):
 
 # ── Main ────────────────────────────────────────────────────────────────
 
+def _build_starttls_context():
+    """Load Let's Encrypt cert for STARTTLS. Returns None if unavailable —
+    relay still starts but in plaintext mode (strict senders will refuse)."""
+    if not os.path.exists(TLS_CERT) or not os.path.exists(TLS_KEY):
+        log.warning("TLS cert/key missing (%s) — STARTTLS NOT advertised", TLS_CERT)
+        return None
+    try:
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(certfile=TLS_CERT, keyfile=TLS_KEY)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        return ctx
+    except Exception as e:
+        log.error("TLS context load failed (%s): %s", TLS_CERT, e)
+        return None
+
+
 def main():
     log.info(f"Starting relay: {HOSTNAME}")
 
-    controller = Controller(InboundHandler(), hostname="0.0.0.0", port=25, server_hostname=HOSTNAME)
+    tls_ctx = _build_starttls_context()
+    kwargs = {"hostname": "0.0.0.0", "port": 25, "server_hostname": HOSTNAME}
+    if tls_ctx is not None:
+        kwargs["tls_context"] = tls_ctx
+        kwargs["require_starttls"] = False
+        log.info("STARTTLS enabled (cert: %s)", TLS_CERT)
+    else:
+        log.warning("STARTTLS DISABLED — strict senders will bounce mail")
+    controller = Controller(InboundHandler(), **kwargs)
     controller.start()
     log.info("SMTP listening on :25")
 
@@ -535,8 +630,7 @@ chmod 600 /opt/bastion-relay/relay.py
 # 5. Environment file (secrets go here, not in the service)
 # ============================================================================
 
-read -p "Admin API URL (e.g., https://bastionhq.me): " ADMIN_API_URL < /dev/tty
-[[ -z "$ADMIN_API_URL" ]] && ADMIN_API_URL="https://bastionhq.me"
+prompt_with_default "Admin API URL (e.g., https://bastionhq.me)" "${ADMIN_API_URL_DEFAULT:-https://bastionhq.me}" ADMIN_API_URL
 
 cat > /opt/bastion-relay/.env << EOF
 MAIL_API_URL=$API_URL
@@ -679,8 +773,14 @@ echo "0 3 * * * root certbot renew --quiet --deploy-hook 'systemctl restart bast
 # 8. Start
 # ============================================================================
 
-log "Starting relay..."
-systemctl start bastion-relay
+if [ "$EXISTING_INSTALL" -eq 1 ]; then
+    log "Restarting relay to apply updates..."
+    systemctl restart bastion-relay
+    systemctl restart nginx 2>/dev/null || true
+else
+    log "Starting relay..."
+    systemctl start bastion-relay
+fi
 sleep 2
 
 if systemctl is-active --quiet bastion-relay; then
