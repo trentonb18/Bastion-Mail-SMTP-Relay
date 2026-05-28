@@ -1,0 +1,14 @@
+# Keep shell scripts, Python, and config files with LF line endings even when
+# the repo is checked out on Windows. The script gets piped to bash on the VPS
+# via curl/wget; CRLF endings silently break `read -p ... < /dev/tty` and the
+# `#!/bin/bash` shebang.
+*.sh        text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+env.example text eol=lf
+Dockerfile  text eol=lf
+
+# Default to native line endings for everything else (docs etc.)
+* text=auto
