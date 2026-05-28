@@ -44,25 +44,39 @@ API_URL_DEFAULT=""
 API_SECRET_DEFAULT=""
 LE_EMAIL_DEFAULT=""
 ADMIN_API_URL_DEFAULT=""
+# Helper: pull a single KEY= line out of /opt/bastion-relay/.env. Wrapped in
+# `|| true` so a missing field (older .env files lack newer keys) can't kill
+# the script via pipefail + set -e.
+_env_value() {
+    grep -E "^$1=" /opt/bastion-relay/.env 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
 if [ -f /opt/bastion-relay/.env ]; then
     EXISTING_INSTALL=1
     log "Existing installation detected — current values in /opt/bastion-relay/.env will be used as defaults"
-    # Parse only the lines we care about (avoid 'source' executing anything)
-    HOSTNAME_DEFAULT=$(grep -E '^HOSTNAME=' /opt/bastion-relay/.env | head -1 | cut -d= -f2-)
-    API_URL_DEFAULT=$(grep -E '^MAIL_API_URL=' /opt/bastion-relay/.env | head -1 | cut -d= -f2-)
-    API_SECRET_DEFAULT=$(grep -E '^API_SECRET=' /opt/bastion-relay/.env | head -1 | cut -d= -f2-)
-    ADMIN_API_URL_DEFAULT=$(grep -E '^ADMIN_API_URL=' /opt/bastion-relay/.env | head -1 | cut -d= -f2-)
+    HOSTNAME_DEFAULT=$(_env_value HOSTNAME)
+    API_URL_DEFAULT=$(_env_value MAIL_API_URL)
+    API_SECRET_DEFAULT=$(_env_value API_SECRET)
+    ADMIN_API_URL_DEFAULT=$(_env_value ADMIN_API_URL)
 fi
-# Let's Encrypt remembers the email — we can pull from there for renewals
+
+# Let's Encrypt regr.json holds the renewal email — best-effort extract.
+# Wrapped in `|| true` so a missing field never aborts the script.
 if [ -d /etc/letsencrypt/accounts ]; then
-    LE_EMAIL_DEFAULT=$(find /etc/letsencrypt/accounts -name regr.json 2>/dev/null | head -1 | xargs -r grep -oE '"mailto:[^"]+"' 2>/dev/null | head -1 | sed 's|"mailto:||;s|"$||')
+    LE_EMAIL_DEFAULT=$( { find /etc/letsencrypt/accounts -name regr.json 2>/dev/null \
+        | head -1 \
+        | xargs -r grep -oE '"mailto:[^"]+"' 2>/dev/null \
+        | head -1 \
+        | sed 's|"mailto:||;s|"$||' ; } || true )
 fi
 
 prompt_with_default() {
     local prompt="$1" default="$2" varname="$3"
     local display_default=""
+    local input=""
     if [ -n "$default" ]; then display_default=" [$default]"; fi
-    read -p "${prompt}${display_default}: " input < /dev/tty
+    # `|| true` keeps a transient /dev/tty failure from aborting the script
+    read -p "${prompt}${display_default}: " input < /dev/tty || true
     if [ -z "$input" ]; then input="$default"; fi
     eval "$varname=\"$input\""
 }
